@@ -77,6 +77,8 @@ class RMSAEnv(OpticalNetworkEnv):
         for lnk in self.topology.edges():
             self.topology[lnk[0]][lnk[1]]["c_band_active_conns"] = []
             self.topology[lnk[0]][lnk[1]]["l_band_active_conns"] = []
+            self.topology[lnk[0]][lnk[1]]['l_band_fragmentation'] = 0.0
+            self.topology[lnk[0]][lnk[1]]['c_band_fragmentation'] = 0.0
 
         
 
@@ -247,13 +249,41 @@ class RMSAEnv(OpticalNetworkEnv):
         return node_features
     
     def compute_path_edge_features(self, service):
-        """Computes normalized edge features for each link in candidate paths."""
+        """Computes normalized edge features with continuous blocks across path."""
         path_features = {}
         paths = self.k_shortest_paths[service.source, service.destination]
         
         for path_idx, path in enumerate(paths):
             path_edge_features = []
             
+            # First get continuous slots across entire path
+            # Start with first edge's slots
+            node1, node2 = path.node_list[0], path.node_list[1]
+            link_idx = self.topology[node1][node2]['index']
+            
+            # Initialize C-band and L-band slots from first edge
+            c_slots = self.topology.graph['available_slots'][link_idx, :100].copy()
+            l_slots = self.topology.graph['available_slots'][
+                link_idx + self.topology.number_of_edges(), 100:256].copy()
+            
+            # AND operation across all edges to ensure continuity
+            for i in range(1, len(path.node_list) - 1):
+                node1, node2 = path.node_list[i], path.node_list[i + 1]
+                link_idx = self.topology[node1][node2]['index']
+                
+                c_slots &= self.topology.graph['available_slots'][link_idx, :100]
+                l_slots &= self.topology.graph['available_slots'][
+                    link_idx + self.topology.number_of_edges(), 100:256]
+
+            # Use RMSA's RLE to find continuous blocks
+            c_initial_indices, c_values, c_lengths = RMSAEnv.rle(c_slots)
+            l_initial_indices, l_values, l_lengths = RMSAEnv.rle(l_slots)
+            
+            # Get indices of available blocks (where value is 1)
+            c_available_indices = np.where(c_values == 1)[0]
+            l_available_indices = np.where(l_values == 1)[0]
+            
+            # Now compute features for each edge
             for i in range(len(path.node_list) - 1):
                 node1, node2 = path.node_list[i], path.node_list[i + 1]
                 link_idx = self.topology[node1][node2]['index']
@@ -262,48 +292,50 @@ class RMSAEnv(OpticalNetworkEnv):
                 edge_features = np.zeros(16)
                 edge_features[[2,4,6,8]] = -1  # Default start indices
                 
-                # Features already normalized [0-1]:
-                # 1. Free slot ratios
-                c_slots = self.topology.graph['available_slots'][link_idx, :100]
-                edge_features[0] = np.sum(c_slots) / 100.0  # C-band free ratio
+                # 1. Free slot ratios (per edge)
+                curr_c_slots = self.topology.graph['available_slots'][link_idx, :100]
+                curr_l_slots = self.topology.graph['available_slots'][link_idx + self.topology.number_of_edges(), 100:256]
                 
-                l_slots = self.topology.graph['available_slots'][
-                    link_idx + self.topology.number_of_edges(), 100:256]
-                edge_features[1] = np.sum(l_slots) / 156.0  # L-band free ratio
+                edge_features[0] = np.sum(curr_c_slots) / 100.0
+                edge_features[1] = np.sum(curr_l_slots) / 156.0
                 
-                # 2. Block positions and sizes normalization
-                c_blocks = self.get_available_blocks(path_idx, self.num_bands, 0, self.modulations)
-                if c_blocks['first_fit'][0].size > 0:
-                    edge_features[2] = c_blocks['first_fit'][0][0] / 100.0  # start normalized
-                    edge_features[3] = c_blocks['first_fit'][1][0] / 100.0  # size normalized
+                # 2. Block positions and sizes (continuous across path)
+                if len(c_available_indices) > 0:
+                    # First-fit block in C-band
+                    first_idx = c_available_indices[0]
+                    edge_features[2] = c_initial_indices[first_idx] / 100.0
+                    edge_features[3] = c_lengths[first_idx] / 100.0
+                    
+                    # Last-fit block in C-band
+                    last_idx = c_available_indices[-1]
+                    edge_features[4] = c_initial_indices[last_idx] / 100.0
+                    edge_features[5] = c_lengths[last_idx] / 100.0
                 
-                if c_blocks['last_fit'][0].size > 0:
-                    edge_features[4] = c_blocks['last_fit'][0][0] / 100.0   # start normalized
-                    edge_features[5] = c_blocks['last_fit'][1][0] / 100.0   # size normalized
+                if len(l_available_indices) > 0:
+                    # First-fit block in L-band
+                    first_idx = l_available_indices[0]
+                    edge_features[6] = (l_initial_indices[first_idx] - 100) / 156.0
+                    edge_features[7] = l_lengths[first_idx] / 156.0
+                    
+                    # Last-fit block in L-band
+                    last_idx = l_available_indices[-1]
+                    edge_features[8] = (l_initial_indices[last_idx] - 100) / 156.0
+                    edge_features[9] = l_lengths[last_idx] / 156.0
                 
-                l_blocks = self.get_available_blocks(path_idx, self.num_bands, 1, self.modulations)
-                if l_blocks['first_fit'][0].size > 0:
-                    edge_features[6] = (l_blocks['first_fit'][0][0] - 100) / 156.0  # start normalized
-                    edge_features[7] = l_blocks['first_fit'][1][0] / 156.0  # size normalized
+                # 3. Fragmentation (per edge)
+                edge_features[10] = self._compute_shannon_entropy(curr_c_slots)
+                edge_features[11] = self._compute_shannon_entropy(curr_l_slots)
                 
-                if l_blocks['last_fit'][0].size > 0:
-                    edge_features[8] = (l_blocks['last_fit'][0][0] - 100) / 156.0   # start normalized
-                    edge_features[9] = l_blocks['last_fit'][1][0] / 156.0   # size normalized
-                
-                # 3. Fragmentation already normalized [0-1]
-                edge_features[10] = self._compute_shannon_entropy(c_slots)
-                edge_features[11] = self._compute_shannon_entropy(l_slots)
-                
-                # 4. Normalize active connections by max possible
-                max_connections = self.episode_length  # Assuming maximum possible connections
+                # 4. Active connections (per edge)
+                max_connections = self.episode_length
                 edge_features[12] = len(self.topology[node1][node2].get('c_band_active_conns', [])) / max_connections
                 edge_features[13] = len(self.topology[node1][node2].get('l_band_active_conns', [])) / max_connections
                 
-                # 5. Normalize OSNR margins by maximum possible margin
-                max_osnr_margin = 20.0  # Maximum possible OSNR margin
-                edge_features[14] = self.compute_avg_osnr_margin(node1, node2, 'c_band_active_conns') / max_osnr_margin
-                edge_features[15] = self.compute_avg_osnr_margin(node1, node2, 'l_band_active_conns') / max_osnr_margin
-                
+                # 5. OSNR margins (per edge)
+                max_osnr_margin = 20.0
+                edge_features[14] = self.compute_avg_osnr_margin(node1, node2, 'c_band_active_conns') 
+                edge_features[15] = self.compute_avg_osnr_margin(node1, node2, 'l_band_active_conns') 
+
                 path_edge_features.append(edge_features)
             
             path_features[path_idx] = np.array(path_edge_features)
@@ -432,7 +464,7 @@ class RMSAEnv(OpticalNetworkEnv):
         cur_network_compactness = (self._get_network_compactness())  # measuring compactness after the provisioning
         k_paths = self.k_shortest_paths[self.current_service.source, self.current_service.destination]
         path_selected = k_paths[path] if path < self.k_paths else None
-        reward = self.reward(band, path_selected)
+        reward = self.reward(path_selected, band)
         info = {
             "band": band if self.services_accepted else -1,
             "service_blocking_rate": (self.services_processed - self.services_accepted)/ self.services_processed,
@@ -451,12 +483,79 @@ class RMSAEnv(OpticalNetworkEnv):
 
         self._new_service = False
         self._next_service()
-        return (
-            self.observation(), reward,
-            self.episode_services_processed == self.episode_length, info)
+        return (self.observation(), reward, self.episode_services_processed == self.episode_length, info)
         
-    def reward(self, band, path_selected):
-        return super().reward()
+    #def reward(self, band, path_selected):
+    #    return super().reward()
+    
+    def reward(self, path, band):
+        """
+        Compute reward considering:
+        1. Service acceptance
+        2. OSNR margin of allocation
+        3. Fragmentation impact
+        4. Resource utilization
+        """
+        if not self.current_service.accepted:
+            return -1
+            
+        # Get selected path
+        #print(path)
+        #path = self.k_shortest_paths[self.current_service.source, self.current_service.destination][1]
+        #print(path)
+        reward = 0
+        
+        # 1. Base reward for acceptance
+        reward += 1
+        
+        # 2. OSNR margin reward
+        osnr_margin = self.current_service.OSNR_margin
+        osnr_th = self.current_service.OSNR_th
+        normalized_osnr = osnr_margin / osnr_th
+        reward += 0.3 * normalized_osnr
+        
+        # 3. Fragmentation penalty
+        total_fragmentation = 0
+        for i in range(len(path.node_list) - 1):
+            node1, node2 = path.node_list[i], path.node_list[i + 1]
+            if band == 0:  # C-band
+                frag = self.topology[node1][node2]['c_band_fragmentation']
+            else:  # L-band
+                frag = self.topology[node1][node2]['l_band_fragmentation']
+            total_fragmentation += frag
+        
+        avg_fragmentation = total_fragmentation / (len(path.node_list) - 1)
+        reward -= 0.2 * avg_fragmentation  # penalty for fragmentation
+        
+        # 4. Utilization balance reward
+        total_utilization = 0
+        for i in range(len(path.node_list) - 1):
+            node1, node2 = path.node_list[i], path.node_list[i + 1]
+            if band == 0:
+                util = self.topology[node1][node2]['c_band_util']
+            else:
+                util = self.topology[node1][node2]['l_band_util']
+            total_utilization += util
+        
+        avg_utilization = total_utilization / (len(path.node_list) - 1)
+        # Reward for balanced utilization (closest to 0.5)
+        balance_metric = 1 - 2 * abs(0.5 - avg_utilization)
+        #reward += 0.2 * balance_metric
+
+        # Band preference based on modulation
+        modulation = self.current_service.modulation_format
+        if modulation in ['BPSK', 'QPSK']:
+            if band == 1:  # L-band
+                reward += 0.2  # Bonus for using preferred band
+            else:  # C-band
+                reward -= 0.1  # Penalty for using non-preferred band
+        elif modulation in ['8QAM', '16QAM']:
+            if band == 0:  # C-band
+                reward += 0.2  # Bonus for using preferred band
+            else:  # L-band
+                reward -= 0.1  # Penalty for using non-preferred band
+        
+        return reward
     
     def reset(self, only_episode_counters=True):
         self.episode_bit_rate_requested = 0
@@ -512,6 +611,10 @@ class RMSAEnv(OpticalNetworkEnv):
         for lnk in self.topology.edges():
             self.topology[lnk[0]][lnk[1]]["external_fragmentation"] = 0.0
             self.topology[lnk[0]][lnk[1]]["compactness"] = 0.0
+            self.topology[lnk[0]][lnk[1]]["c_band_active_conns"] = []
+            self.topology[lnk[0]][lnk[1]]["l_band_active_conns"] = []
+            self.topology[lnk[0]][lnk[1]]['l_band_fragmentation'] = 0.0
+            self.topology[lnk[0]][lnk[1]]['c_band_fragmentation'] = 0.0
 
         self._new_service = False
         self._next_service()
@@ -610,7 +713,7 @@ class RMSAEnv(OpticalNetworkEnv):
 
             self.topology[node1][node2]["running_services"].remove(service)
             self.topology[node1][node2][active_conns].remove(service)
-            self._update_link_stats(service.path.node_list[i], service.path.node_list[i + 1])
+            self._update_band_stats(node1, node2, service.band )
             
         self.topology.graph["running_services"].remove(service)
         # Remove service from band-specific tracking
@@ -636,59 +739,6 @@ class RMSAEnv(OpticalNetworkEnv):
 
         self.topology.graph["last_update"] = self.current_time
 
-    # def _update_link_stats(self, node1: str, node2: str):
-    #     last_update = self.topology[node1][node2]["last_update"]
-    #     time_diff = self.current_time - self.topology[node1][node2]["last_update"]
-    #     if self.current_time > 0:
-    #         last_util = self.topology[node1][node2]["utilization"]
-    #         cur_util = (self.num_spectrum_resources- np.sum(self.topology.graph["available_slots"][self.topology[node1][node2]["index"], :])) / self.num_spectrum_resources
-    #         utilization = ((last_util * last_update) + (cur_util * time_diff)) / self.current_time
-    #         self.topology[node1][node2]["utilization"] = utilization
-
-    #         slot_allocation = self.topology.graph["available_slots"][self.topology[node1][node2]["index"], :]
-
-    #         # implementing fragmentation from https://ieeexplore.ieee.org/abstract/document/6421472
-    #         last_external_fragmentation = self.topology[node1][node2]["external_fragmentation"]
-            
-    #         last_compactness = self.topology[node1][node2]["compactness"]
-
-    #         cur_external_fragmentation = 0.0
-    #         cur_link_compactness = 0.0
-    #         if np.sum(slot_allocation) > 0:
-    #             initial_indices, values, lengths = RMSAEnv.rle(slot_allocation)
-
-    #             # computing external fragmentation from https://ieeexplore.ieee.org/abstract/document/6421472
-    #             unused_blocks = [i for i, x in enumerate(values) if x == 1]
-    #             max_empty = 0
-    #             if len(unused_blocks) > 1 and unused_blocks != [0, len(values) - 1]:
-    #                 max_empty = max(lengths[unused_blocks])
-    #             cur_external_fragmentation = 1.0 - (float(max_empty) / float(np.sum(slot_allocation)))
-
-    #             # computing link spectrum compactness from https://ieeexplore.ieee.org/abstract/document/6421472
-    #             used_blocks = [i for i, x in enumerate(values) if x == 0]
-
-    #             if len(used_blocks) > 1:
-    #                 lambda_min = initial_indices[used_blocks[0]]
-    #                 lambda_max = (initial_indices[used_blocks[-1]] + lengths[used_blocks[-1]])
-
-    #                 # evaluate again only the "used part" of the spectrum
-    #                 internal_idx, internal_values, internal_lengths = RMSAEnv.rle(slot_allocation[lambda_min:lambda_max])
-    #                 unused_spectrum_slots = np.sum(1 - internal_values)
-
-    #                 if unused_spectrum_slots > 0:
-    #                     cur_link_compactness = ((lambda_max - lambda_min) / np.sum(1 - slot_allocation)) * (1 / unused_spectrum_slots)
-    #                 else:
-    #                     cur_link_compactness = 1.0
-    #             else:
-    #                 cur_link_compactness = 1.0
-
-    #         external_fragmentation = ((last_external_fragmentation * last_update) + (cur_external_fragmentation * time_diff)) / self.current_time
-    #         self.topology[node1][node2]["external_fragmentation"] = external_fragmentation
-
-    #         link_compactness = ((last_compactness * last_update) + (cur_link_compactness * time_diff)) / self.current_time
-    #         self.topology[node1][node2]["compactness"] = link_compactness
-
-    #     self.topology[node1][node2]["last_update"] = self.current_time
 
     def _update_band_stats(self, node1: str, node2: str, band: int):
         """
@@ -734,17 +784,6 @@ class RMSAEnv(OpticalNetworkEnv):
                 'last_update': self.current_time
             })
    
-    # def _update_band_stats(self, node1, node2, band):
-    #     link_idx = self.topology[node1][node2]['index']
-        
-    #     if band == 0:  # C-band
-    #         slots = self.topology.graph['available_slots'][link_idx, :100]
-    #         active_conns = 'c_band_active_conns'
-    #     else:  # L-band
-    #         slots = self.topology.graph['available_slots'][link_idx, 100:256]
-    #         active_conns = 'l_band_active_conns'
-        
-    #     self.topology[node1][node2][active_conns].append(self.current_service)
 
     def _next_service(self):
         if self._new_service:
@@ -910,10 +949,7 @@ class RMSAEnv(OpticalNetworkEnv):
             - last_fit: (initial_indices, lengths) for last j blocks
         """
         # Get available slots across the whole path
-        available_slots = self.get_available_slots(
-            self.k_shortest_paths[self.current_service.source, self.current_service.destination][path], 
-            band
-        )
+        available_slots = self.get_available_slots(self.k_shortest_paths[self.current_service.source, self.current_service.destination][path], band)
         
         # Get number of slots needed
         slots = self.get_number_slots(

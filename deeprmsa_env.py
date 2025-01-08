@@ -1,6 +1,7 @@
 from typing import Tuple
 
 import gym
+import gym.spaces
 import numpy as np
 
 from .rmsa_env import RMSAEnv
@@ -43,21 +44,24 @@ class DeepRMSAEnv(RMSAEnv):
         self.action_space = gym.spaces.Discrete(total_actions)
 
         max_path_length = self.get_max_path_length() #max number of edges in a path
+        #print("Max path length",max_path_length)
         # New observation space for GAT features
-        self.observation_space = gym.spaces.Dict({
-            'edge_features': gym.spaces.Box(
-                low=-1, high=1, 
-                shape=(self.k_paths, max_path_length, 16),  # 16 edge features
-                dtype=np.float32
-            ),
-            'service_info': gym.spaces.Box(
-                low=0, high=1,
-                shape=(2,),  # bit_rate, holding_time
-                dtype=np.float32
-            )
-        })
+        num_nodes = self.topology.number_of_nodes()
+    
+
+        num_edge_features = self.k_paths * self.get_max_path_length() * 16
+        num_service_info = 2 * self.topology.number_of_nodes() + 1  # Source-destination + bit rate
+
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(num_edge_features + num_service_info,),
+            dtype=np.float32
+        )
         self.action_space.seed(self.rand_seed)
         self.observation_space.seed(self.rand_seed)
+
+        
 
         self.reset(only_episode_counters=False)
 
@@ -81,29 +85,54 @@ class DeepRMSAEnv(RMSAEnv):
                         
         return max_length
 
+
+
     def observation(self):
-        """Returns GAT-ready observation."""
-        # Get edge features for all k-paths
+        """Returns a flattened observation combining edge features and service info."""
+        # Get edge features (shape: [k_paths, max_path_length, 16])
         path_features = self.compute_path_edge_features(self.current_service)
         
-        # Service information
-        service_info = np.array([
-            self.current_service.bit_rate / 100,
-            self.current_service.source_id, 
-            self.current_service.destination_id
-        ])
+        # Create edge features array
+        max_path_length = self.get_max_path_length()
+        edge_features_array = np.zeros((self.k_paths, max_path_length, 16), dtype=np.float32)
+        for path_idx, features in path_features.items():
+            path_len = len(features)
+            if path_len > max_path_length:
+                edge_features_array[path_idx] = features[:max_path_length]
+            else:
+                edge_features_array[path_idx, :path_len] = features
         
-        return {
-            'edge_features': path_features,
-            'service_info': service_info
-        }
+        # Flatten edge features
+        flat_edge_features = edge_features_array.flatten()
+
+        # Create source-destination one-hot encoding
+        source_destination_tau = np.zeros((2, self.topology.number_of_nodes()), dtype=np.float32)
+        source_destination_tau[0, self.current_service.source_id] = 1
+        source_destination_tau[1, self.current_service.destination_id] = 1
+
+        # Flatten source-destination
+        flat_source_destination = source_destination_tau.flatten()
+
+        # Normalize bit rate
+        bit_rate = np.array([self.current_service.bit_rate / 100], dtype=np.float32)
+
+        # Combine all parts into a single flattened array
+        flattened_observation = np.concatenate([flat_edge_features, flat_source_destination, bit_rate])
+
+        #print(f"Flattened observation shape: {flattened_observation.shape}")
+        #print(f"Expected shape: {self.observation_space.shape}")
+        
+        return flattened_observation
+
 
     def step(self, action):
         """Handle GAT-based action selection."""
         path_idx, band, fit_type = self._get_route_band_block_id(action)
+        #print(path_idx, band, fit_type)
         
         # Get blocks for selected band
-        blocks = self.get_available_blocks(path_idx, self.num_bands, band, self.modulations)
+        blocks = self.get_available_blocks_FLF(path_idx, self.num_bands, band, self.modulations)
+        #print(blocks)
         
         # Select block based on fit_type
         if fit_type == 0:  # first-fit
@@ -125,72 +154,9 @@ class DeepRMSAEnv(RMSAEnv):
 
 
     
-    def reward(self, path_idx, band, fit_type):
-        """
-        Compute reward considering:
-        1. Service acceptance
-        2. OSNR margin of allocation
-        3. Fragmentation impact
-        4. Resource utilization
-        """
-        if not self.current_service.accepted:
-            return -1
-            
-        # Get selected path
-        path = self.k_shortest_paths[self.current_service.source, self.current_service.destination][path_idx]
-        reward = 0
+    def reward(self, path_idx, band):
+        return super().reward(path_idx, band)
         
-        # 1. Base reward for acceptance
-        reward += 1
-        
-        # 2. OSNR margin reward
-        osnr_margin = self.current_service.OSNR_margin
-        osnr_th = self.current_service.OSNR_th
-        normalized_osnr = osnr_margin / osnr_th
-        reward += 0.3 * normalized_osnr
-        
-        # 3. Fragmentation penalty
-        total_fragmentation = 0
-        for i in range(len(path.node_list) - 1):
-            node1, node2 = path.node_list[i], path.node_list[i + 1]
-            if band == 0:  # C-band
-                frag = self.topology[node1][node2]['c_band_fragmentation']
-            else:  # L-band
-                frag = self.topology[node1][node2]['l_band_fragmentation']
-            total_fragmentation += frag
-        
-        avg_fragmentation = total_fragmentation / (len(path.node_list) - 1)
-        reward -= 0.2 * avg_fragmentation  # penalty for fragmentation
-        
-        # 4. Utilization balance reward
-        total_utilization = 0
-        for i in range(len(path.node_list) - 1):
-            node1, node2 = path.node_list[i], path.node_list[i + 1]
-            if band == 0:
-                util = self.topology[node1][node2]['c_band_util']
-            else:
-                util = self.topology[node1][node2]['l_band_util']
-            total_utilization += util
-        
-        avg_utilization = total_utilization / (len(path.node_list) - 1)
-        # Reward for balanced utilization (closest to 0.5)
-        balance_metric = 1 - 2 * abs(0.5 - avg_utilization)
-        reward += 0.2 * balance_metric
-
-        # Band preference based on modulation
-        modulation = self.current_service.modulation_format
-        if modulation in ['BPSK', 'QPSK']:
-            if band == 1:  # L-band
-                reward += 0.2  # Bonus for using preferred band
-            else:  # C-band
-                reward -= 0.1  # Penalty for using non-preferred band
-        elif modulation in ['8QAM', '16QAM']:
-            if band == 0:  # C-band
-                reward += 0.2  # Bonus for using preferred band
-            else:  # L-band
-                reward -= 0.1  # Penalty for using non-preferred band
-        
-        return reward
 
     def reset(self, only_episode_counters=True):
         return super().reset(only_episode_counters=only_episode_counters)

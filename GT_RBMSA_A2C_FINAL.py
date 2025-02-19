@@ -12,79 +12,64 @@ from typing import Tuple, Optional, List, Dict, Union, Type, Callable
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-#from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
+
 
 class GATLayer(nn.Module):
     def __init__(self, output_dim: int, input_dim: int, num_heads: int = 8, dropout_rate: float = 0.2):
         super().__init__()
         self.output_dim = output_dim
-        self.input_dim = input_dim  # Add input dimension
         self.num_heads = num_heads
         self.dropout = nn.Dropout(dropout_rate)
+        self.W = nn.Parameter(th.empty(num_heads, input_dim, output_dim))
+        # self.a: [num_heads, 2 * output_dim, 1]
+        self.a = nn.Parameter(th.empty(num_heads, 2 * output_dim, 1))
         
-        # Initialize weights for each attention head
-        self.W = nn.ParameterList()
-        self.a = nn.ParameterList()
-        
-        for _ in range(num_heads):
-            self.W.append(nn.Parameter(th.empty(input_dim, output_dim)))
-            self.a.append(nn.Parameter(th.empty(2 * output_dim, 1)))
-            
         self.reset_parameters()
         
     def reset_parameters(self):
         gain = nn.init.calculate_gain('relu')
-        for w, a in zip(self.W, self.a):
-            nn.init.xavier_uniform_(w, gain=gain)
-            nn.init.xavier_uniform_(a, gain=gain)
+        nn.init.xavier_uniform_(self.W, gain=gain)
+        nn.init.xavier_uniform_(self.a, gain=gain)
 
     def forward(self, inputs):
-        H, adj = inputs  # H: node features, adj: adjacency matrix
-        B = H.size(0)  # batch size
-        N = H.size(1)  # number of nodes
-
-        #print("H", H)
+        H, adj = inputs  # H: [B, N, input_dim], adj: [B, N, N]
+        B, N, _ = H.shape
+        Wh = th.einsum('bni,hio->bhno', H, self.W)
+        Wh_i = Wh.unsqueeze(3)
+        Wh_j = Wh.unsqueeze(2)
         
-        outputs = []
-        attentions = []
+        # Concatenate along the feature dimension: [B, num_heads, N, N, 2*output_dim]
+        concat = th.cat([Wh_i.expand(-1, -1, -1, N, -1),
+                         Wh_j.expand(-1, -1, N, -1, -1)], dim=-1)
+        a_exp = self.a.unsqueeze(0).unsqueeze(2).unsqueeze(2)
+        e = th.matmul(concat.unsqueeze(-2), a_exp).squeeze(-1).squeeze(-1)
         
-        for head in range(self.num_heads):
-            Wh = th.matmul(H, self.W[head])
-            
-            repeated_Wh = Wh.unsqueeze(2).repeat(1, 1, N, 1)
-            repeated_Wh_T = Wh.unsqueeze(1).repeat(1, N, 1, 1)
-            attention_input = th.cat([repeated_Wh, repeated_Wh_T], dim=-1)
-            
-            e = th.matmul(attention_input, self.a[head])
-            e = e.squeeze(-1)
-            
-            mask = adj.bool()
-            e = th.where(mask, e, th.tensor(-9e15).to(e.device))
-            
-            alpha = F.softmax(e, dim=-1)
-            alpha = self.dropout(alpha)
-            
-            h_prime = th.matmul(alpha, Wh)
-            
-            outputs.append(h_prime)
-            attentions.append(alpha)
-            
-        multi_head_output = th.cat(outputs, dim=-1)
-        multi_head_attention = th.stack(attentions, dim=1)
+        # Apply mask: adj: [B, N, N] -> unsqueeze to [B, 1, N, N]
+        mask = adj.unsqueeze(1).bool()
+        e = th.where(mask, e, th.tensor(-9e15, device=e.device))
         
-        return F.relu(multi_head_output), multi_head_attention
+        # Softmax to obtain attention coefficients over neighbors.
+        alpha = F.softmax(e, dim=-1)
+        alpha = self.dropout(alpha)
+        h_prime = th.matmul(alpha, Wh)
+        h_prime = h_prime.permute(0, 2, 1, 3).reshape(B, N, self.num_heads * self.output_dim)
+        
+        return F.relu(h_prime), alpha
 
 class EmbeddingWithPositionalEncoding(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int, max_seq_length: int, learnable_pos: bool = True):
+    def __init__(self, vocab_size: int, d_model: int, max_seq_length: int, learnable_pos: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.max_seq_length = max_seq_length
         self.learnable_pos = learnable_pos
         
+        # Token embedding layer
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         
+        # Positional encoding: either learnable or fixed (using sinusoidal encoding)
         if learnable_pos:
             self.pos_embedding = nn.Parameter(th.randn(max_seq_length, d_model) * 0.1)
         else:
@@ -100,25 +85,20 @@ class EmbeddingWithPositionalEncoding(nn.Module):
         return pos_encoding
 
     def forward(self, inputs):
-        # inputs shape: [batch_size, k_paths, seq_length]
         batch_size, k_paths, seq_length = inputs.shape
-        
-        # Reshape for embedding
-        flat_inputs = inputs.view(-1, seq_length)  # [batch_size * k_paths, seq_length]
 
-        # Get token embeddings
-        token_embeds = self.token_embedding(flat_inputs)  # [batch_size * k_paths, seq_length, d_model]
+        # Flatten the first two dimensions to feed into the embedding layer.
+        flat_inputs = inputs.reshape(-1, seq_length)  # shape: [batch_size * k_paths, seq_length]
+        token_embeds = self.token_embedding(flat_inputs)  # shape: [batch_size * k_paths, seq_length, d_model]
         
-        # Add positional encoding
-        pos_encoding = self.pos_embedding[:seq_length].unsqueeze(0)  # [1, seq_length, d_model]
-        pos_encoding = pos_encoding.expand(batch_size * k_paths, -1, -1)  # [batch_size * k_paths, seq_length, d_model]
+        # Get positional encoding for the given sequence length.
+        # Instead of calling expand(), rely on broadcasting.
+        pos_encoding = self.pos_embedding[:seq_length].unsqueeze(0)  # shape: [1, seq_length, d_model]
+        output = token_embeds + pos_encoding  # shape: [batch_size * k_paths, seq_length, d_model]
         
-        # Add and reshape back
-        output = token_embeds + pos_encoding  # [batch_size * k_paths, seq_length, d_model]
-        output = output.view(batch_size, k_paths, seq_length, self.d_model)  # [batch_size, k_paths, seq_length, d_model]
-        
+        # Reshape back to the original dimensions
+        output = output.reshape(batch_size, k_paths, seq_length, self.d_model)
         return output
-    
 
 class SimpleTransformerBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int, ff_dim: int, dropout: float = 0.1):
@@ -139,19 +119,9 @@ class SimpleTransformerBlock(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, path_inputs, gat_kv, training=True, self_attn_mask=None):
-        # Print input shapes for debugging
-        #print(f"Path inputs shape: {path_inputs.shape}")
-        #print(f"GAT KV shape: {gat_kv.shape}")
-        
-        # path_inputs: [batch_size * k_paths, seq_length, d_model]
         batch_size_k = path_inputs.size(0)
         seq_length = path_inputs.size(1)
-        
-        # Prepare GAT output for cross attention
-        # Reshape GAT output to match batch size
-        gat_kv = gat_kv.repeat_interleave(batch_size_k // gat_kv.size(0), dim=0)
-        #print(f"Reshaped GAT KV shape: {gat_kv.shape}")
-        
+        gat_kv = gat_kv.repeat_interleave(batch_size_k // gat_kv.size(0), dim=0) 
         # Transpose for attention: [seq_length, batch_size * k_paths, d_model]
         path_inputs = path_inputs.transpose(0, 1)
         gat_kv = gat_kv.transpose(0, 1)
@@ -209,10 +179,7 @@ class CandidatePathProcessor(nn.Module):
                  num_heads: int, ff_dim: int, learnable_pos: bool = False, dropout_rate: float = 0.1):
         super().__init__()
         self.d_model = d_model
-        self.max_seq_length = max_seq_length
-
-        #print(f"CandidatePathProcessor max_seq_length: {max_seq_length}")  # Debug print
-        
+        self.max_seq_length = max_seq_length    
         self.embedding_layer = EmbeddingWithPositionalEncoding(
             vocab_size=vocab_size,
             d_model=d_model,
@@ -230,23 +197,15 @@ class CandidatePathProcessor(nn.Module):
         self.attention_pooling = AttentionPooling(d_model)
         
     def forward(self, candidate_tokens, gat_kv, training=True, mask=None):
-        # print(f"Candidate tokens shape: {candidate_tokens.shape}")
-        # print(f"Initial GAT output shape: {gat_kv.shape}")
-        
+
         # Embed tokens
         embedded = self.embedding_layer(candidate_tokens)
-        #print(f"Embedded shape: {embedded.shape}")
-        
         # Reshape for transformer
         batch_size, k_paths, seq_length, d_model = embedded.shape
         embedded_flat = embedded.view(-1, seq_length, d_model)
-        #print(f"Embedded flat shape: {embedded_flat.shape}")
-        
         # Prepare mask
         if mask is not None:
             mask = mask.view(-1, seq_length)
-            #print(f"Mask shape before transformer: {mask.shape}")
-        
         # Process through transformer
         transformer_out = self.transformer_block(
             embedded_flat, 
@@ -254,11 +213,8 @@ class CandidatePathProcessor(nn.Module):
             training=training,
             self_attn_mask=mask
         )
-        #print(f"Transformer output shape: {transformer_out.shape}")
-        
         # Reshape back
         transformer_out = transformer_out.view(batch_size, k_paths, seq_length, d_model)
-        
         # Pool output
         pooled_output = self.attention_pooling(transformer_out, mask=mask.view(batch_size, k_paths, seq_length))
         #print(f"Pooled output shape: {pooled_output.shape}")
@@ -366,9 +322,6 @@ class DeepRMSANetwork(nn.Module):
         link_features = inputs[:, idx:idx + link_features_size]
         link_features = link_features.view(batch_size, self.num_edges, features_per_link)
         idx += link_features_size
-
-        # Print shapes for debugging
-        #print(f"Link features shape: {link_features.shape}")
         
         # Edge adjacency
         edge_adj_size = self.num_edges * self.num_edges
@@ -394,11 +347,7 @@ class DeepRMSANetwork(nn.Module):
         source_dest_tiled = source_dest.unsqueeze(1).repeat(1, self.k_paths, 1)
         slots_expanded = slots_per_path.unsqueeze(-1)
         global_features = th.cat([source_dest_tiled, slots_expanded], dim=-1)
-        
-        # print(f"\nFeature shapes before band processing:")
-        # print(f"Pooled path: {attn_pooled_path.shape}")
-        # print(f"Spectrum: {spectrum.shape}")
-        # print(f"Global features: {global_features.shape}")
+
         
         # Process C and L bands
         shared_c = self._process_band(
@@ -419,25 +368,18 @@ class DeepRMSANetwork(nn.Module):
         return shared_features
 
     def _process_band(self, path_features, band_spectrum, global_features):
-        # print(f"Processing band shapes:")
-        # print(f"Path features: {path_features.shape}")
-        # print(f"Band spectrum: {band_spectrum.shape}")
-        # print(f"Global features: {global_features.shape}")
-        # Concatenate along feature dimension
+
         x = th.cat([path_features, band_spectrum, global_features], dim=-1)
-        #print(f"Concatenated features shape: {x.shape}")
+
 
         # Process through dense layers
         batch_size, k_paths, _ = x.shape
         x = x.view(batch_size * k_paths, -1)  # Flatten for dense layers
-        #print(f"Flattened shape before dense: {x.shape}")
+
         
         for layer in self.dense_layers:
-            x = F.relu(layer(x))
-            #print(f"After dense layer {layer} shape: {x.shape}")
-            
+            x = F.relu(layer(x))    
         x = x.view(batch_size, k_paths, -1)  # Reshape back
-        #print(f"Final shape after processing: {x.shape}")
         return x
 
     def tokenize_candidate_paths(self, path_vector):
@@ -461,10 +403,6 @@ class DeepRMSANetwork(nn.Module):
         tokenized = th.stack(tokenized).view(batch_size, k_paths, self.P)
         mask = tokenized != 0
 
-        # Add prints for debugging
-        # print(f"Tokenized shape: {tokenized.shape}")
-        # print(f"Mask shape: {mask.shape}")
-        
         return tokenized, mask
     
 
@@ -528,11 +466,7 @@ class AC_Net(nn.Module):
         # Process through policy head
         policy_logits = self.policy_head(flat_features)
         value = self.value_head(flat_features)
-        
-        # Print shapes for debugging
-        # print(f"Shared features shape: {shared_features.shape}")
-        # print(f"Policy output shape: {policy_logits.shape}")
-        # print(f"Value output shape: {value.shape}")
+
         
         return policy_logits, value
 
@@ -581,6 +515,8 @@ class DeepRMSA_A2C:
         self.episode_rewards = []
         self.episode_lengths = []
         self.episode_blocking_rates = []
+        self.episode_bit_rate_blocking_rates = []
+        self.episode_count = 0
 
 
     @th.no_grad()
@@ -667,8 +603,10 @@ class DeepRMSA_A2C:
 
                 if done:
                     episode_count += 1
+                    self.episode_count += 1
                     self.episode_rewards.append(episode_reward)
                     self.episode_blocking_rates.append(info.get('episode_service_blocking_rate', 0))
+                    self.episode_bit_rate_blocking_rates.append(info.get('episode_bit_rate_blocking_rate', 0))
                     
                     state = self.env.reset()
                     episode_reward = 0
@@ -705,7 +643,7 @@ class DeepRMSA_A2C:
             mean_blocking = np.mean(self.episode_blocking_rates[-100:]) if self.episode_blocking_rates else 0
             
             pbar.set_postfix({
-                'episode': episode_count,
+                'episode': self.episode_count,
                 'mean_reward': f'{mean_reward:.2f}',
                 'mean_blocking': f'{mean_blocking:.4f}',
                 'policy_loss': f'{policy_loss:.4f}',
@@ -749,92 +687,94 @@ class DeepRMSA_A2C:
         return policy_loss.item(), value_loss.item(), entropy.item()
     
 
-def main():
-    # Set up argument parser
-    parser = argparse.ArgumentParser(description='Train DeepRMSA A2C')
-    parser.add_argument('--timesteps', type=int, default=1000000,
-                      help='Total timesteps for training')
-    parser.add_argument('--n-steps', type=int, default=5,
-                      help='Number of steps for returns calculation')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                      help='Learning rate')
-    parser.add_argument('--gamma', type=float, default=0.99,
-                      help='Discount factor')
-    parser.add_argument('--seed', type=int, default=42,
-                      help='Random seed')
-    parser.add_argument('--log-interval', type=int, default=10,
-                      help='Log interval (episodes)')
-    args = parser.parse_args()
 
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Train or retrain DeepRMSA A2C')
+    parser.add_argument('--timesteps', type=int, default=15000,
+                        help='Total timesteps for training')
+    parser.add_argument('--gamma', type=float, default=0.95,
+                        help='Discount factor')
+    parser.add_argument('--load_model', type=str, default="",
+                        help='Path to a saved checkpoint to retrain from')
+    args = parser.parse_args()
+    
     # Set random seeds
-    th.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    if th.cuda.is_available():
-        th.cuda.manual_seed(args.seed)
+    th.manual_seed(42)
+    np.random.seed(42)
+    # Set random seeds
+    th.manual_seed(42)
+    np.random.seed(42)
+    
 
     # Set up device
     device = th.device("cuda" if th.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    if th.cuda.is_available():
+        th.cuda.manual_seed(42)
+    
     # Load topology
-    topology_name = 'nsfnet_chen'
+    topology_name = 'cost256'
     k_paths = 5
     with open(f'../topologies/{topology_name}_{k_paths}-paths_new.h5', 'rb') as f:
         topology = pickle.load(f)
-
+    IAT = 0.067
+    
     # Environment setup
     env_args = dict(
         num_bands=2,
         topology=topology,
-        seed=args.seed,
+        seed=10,
         allow_rejection=False,
         j=1,
-        mean_service_holding_time=20.0,
-        mean_service_inter_arrival_time=0.1,
+        mean_service_holding_time=10.0,
+        mean_service_inter_arrival_time=IAT,
         k_paths=k_paths,
-        episode_length=2000,
+        episode_length=1500,
         node_request_probabilities=None
     )
-
-    # Create logging directories
+    
+    # Create directories with timestamp
     current_time = datetime.now().strftime('%Y%m%d-%H%M%S')
-    log_dir = f"./logs/deeprmsa-a2c/{current_time}"
-    model_dir = f"./models/deeprmsa-a2c/{current_time}"
+    log_dir = f"./logs/deeprmsa-a2c/{IAT}/{current_time}"
+    model_dir = f"./models/deeprmsa-a2c/{IAT}/{current_time}"
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
-
-    # Set up tensorboard writer
-    #writer = SummaryWriter(log_dir)
-
-    # Create environment
+    
+    print("Starting training...")
+    print(f"Logging to {log_dir}")
+    print(f"Models will be saved to {model_dir}")
+    training_params = {'total_timesteps': args.timesteps, 'gamma': args.gamma}
+    for key, value in training_params.items():
+        print(f"{key}: {value}")
+    for key, value in env_args.items():
+        print(f"{key}: {value}")
+    
+    # Create the environment
     env = gym.make('DeepRMSA-v0', **env_args)
+    
+    # Create A2C agent
+        #Best hyperparameters:
 
-    #Best hyperparameters:
     num_gat_heads= 8
     transformer_num_heads=4
     hidden_size= 176
     t_num_layers= 2
-    learning_rate= 5.8149571254746044e-05
-    regu_scalar= 0.00011175400608009141
+    learning_rate= 5.8e-05
+    regu_scalar= 0.000111
     n_steps= 10
-    gamma= 0.9127309210296852
+    gamma= 0.91
     num_dense_layers= 2
     transformer_ff_dim= 256
-    dropout_rate= 0.41515951533184664
-    gat_dropout= 0.19387386978452825
+    dropout_rate= 0.42
+    gat_dropout= 0.19
 
 
-    # # Create model
-    # model = DeepRMSA_A2C(
-    #     env=env,
-    #     num_layers=num_layers,
-    #     layer_size=128,
-    #     learning_rate=learning_rate,
-    #     regu_scalar=regu_scalar
-
-    # )
 # Create and train model
-    model = DeepRMSA_A2C(
+    agent = DeepRMSA_A2C(
         env=env,
         num_layers=t_num_layers,
         layer_size=hidden_size,  # Use hidden_size for layer_size
@@ -847,92 +787,66 @@ def main():
         transformer_num_heads=transformer_num_heads,
         transformer_ff_dim=transformer_ff_dim
     )
-
-
-    # Save configuration
-    config = {
-        'env_args': {
-            'num_bands': env_args['num_bands'],
-            'seed': env_args['seed'],
-            'allow_rejection': env_args['allow_rejection'],
-            'j': env_args['j'],
-            'mean_service_holding_time': env_args['mean_service_holding_time'],
-            'mean_service_inter_arrival_time': env_args['mean_service_inter_arrival_time'],
-            'k_paths': env_args['k_paths'],
-            'episode_length': env_args['episode_length'],
-            'node_request_probabilities': env_args['node_request_probabilities'],
-            'topology_name': topology_name  # Save topology name instead of topology object
-        },
-        'model_args': {
-            'num_layers': 2,
-            'layer_size': 128,
-            'learning_rate': args.lr,
-            'regu_scalar': 1e-3
-        },
-        'training_args': vars(args)
-    }
     
-    with open(os.path.join(log_dir, 'config.json'), 'w') as f:
-        json.dump(config, f, indent=4)
-
+    # Optionally load a saved checkpoint to continue training
+    if args.load_model and os.path.isfile(args.load_model):
+        checkpoint = th.load(args.load_model)
+        agent.network.load_state_dict(checkpoint['model_state_dict'])
+        agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        agent.episode_rewards = checkpoint.get('episode_rewards', [])
+        agent.episode_lengths = checkpoint.get('episode_lengths', [])
+        agent.episode_blocking_rates = checkpoint.get('episode_blocking_rates', [])
+        agent.episode_count = checkpoint.get('episode_count', 0)
+        print(f"Loaded model and metrics from {args.load_model}")
+    
+    with open(os.path.join(log_dir, 'training_params.txt'), 'w') as f:
+        for key, value in training_params.items():
+            f.write(f"{key}: {value}\n")
+    
     try:
-        print("Starting training...")
-        print(f"Logging to {log_dir}")
-        print(f"Models will be saved to {model_dir}")
-
-        # Training loop
-        model.train(
-            total_timesteps=args.timesteps,
-            n_steps=n_steps,
-            gamma=gamma
+        # Train the agent
+        agent.train(
+            total_timesteps=training_params['total_timesteps'],
+            gamma=training_params['gamma'],
+            n_steps=10
         )
-
-        # Save final model
-        th.save({
-            'model_state_dict': model.network.state_dict(),
-            'optimizer_state_dict': model.optimizer.state_dict(),
-        }, os.path.join(model_dir, 'final_model.pth'))
         
-        print(f"\nTraining completed. Final model saved to {model_dir}")
-
+        final_model_path = os.path.join(model_dir, 'final_model.pth')
+        # Save checkpoint including metrics
+        checkpoint = {
+            'model_state_dict': agent.network.state_dict(),
+            'optimizer_state_dict': agent.optimizer.state_dict(),
+            'episode_rewards': agent.episode_rewards,
+            'episode_lengths': agent.episode_lengths,
+            'episode_blocking_rates': agent.episode_blocking_rates,
+            'episode_count': agent.episode_count
+        }
+        th.save(checkpoint, final_model_path)
+        print(f"\nTraining completed. Final checkpoint saved to {final_model_path}")
+        
     except KeyboardInterrupt:
         print("\nTraining interrupted by user")
-        th.save({
-            'model_state_dict': model.network.state_dict(),
-            'optimizer_state_dict': model.optimizer.state_dict(),
-        }, os.path.join(model_dir, 'interrupted_model.pth'))
-
+        interrupted_model_path = os.path.join(model_dir, 'interrupted_model.pth')
+        checkpoint = {
+            'model_state_dict': agent.network.state_dict(),
+            'optimizer_state_dict': agent.optimizer.state_dict(),
+            'episode_rewards': agent.episode_rewards,
+            'episode_lengths': agent.episode_lengths,
+            'episode_blocking_rates': agent.episode_blocking_rates,
+            'episode_count': agent.episode_count
+        }
+        th.save(checkpoint, interrupted_model_path)
+        print(f"Interrupted checkpoint saved to {interrupted_model_path}")
+        
     finally:
-        # Save training curves
         training_data = {
-            'rewards': model.episode_rewards,
-            'lengths': model.episode_lengths,
-            'blocking_rates': model.episode_blocking_rates
+            'rewards': agent.episode_rewards,
+            'lengths': agent.episode_lengths,
+            'blocking_rates': agent.episode_blocking_rates,
+            'episode_count' : agent.episode_count
         }
         np.save(os.path.join(log_dir, 'training_data.npy'), training_data)
-
-        # Plot training curves
-        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
-        
-        ax1.plot(model.episode_rewards)
-        ax1.set_title('Episode Rewards')
-        ax1.set_xlabel('Episode')
-        
-        ax2.plot(model.episode_lengths)
-        ax2.set_title('Episode Lengths')
-        ax2.set_xlabel('Episode')
-        
-        ax3.plot(model.episode_blocking_rates)
-        ax3.set_title('Blocking Rates')
-        ax3.set_xlabel('Episode')
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(log_dir, 'training_curves.png'))
-        plt.close()
-
-        # Close environment and tensorboard writer
         env.close()
-        #writer.close()
 
 if __name__ == "__main__":
     main()
